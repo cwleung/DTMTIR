@@ -1,4 +1,4 @@
-# TECTM
+# DTMTIR
 The repository is for the paper titled "Dynamic Topic Models with Regularization on Temporal Information" by 
 Chun-Wa Leung, Akihiko Takano, and Takeshi Abekawa.
 

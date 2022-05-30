@@ -1,3 +1,4 @@
+import gpytorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +32,7 @@ class Encoder(nn.Module):
         self.bnmu = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
         self.bnlv = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
 
+        
     def get_kl(self, q_mu, q_logsigma, p_mu=None, p_logsigma=None):
         """ Gaussian KL Divergence
         Returns KL( N(q_mu, q_logsigma) || N(p_mu, p_logsigma) ).
@@ -95,7 +97,7 @@ class Decoder(nn.Module):
             # use original embedding
             else:
                 self.fcrho = TopicEmbedding(rho_size, vocab_size, pre_embedding,
-                                            emb_type, dropout, trans_layer, trans_head, trans_dim)
+                                            emb_type, dropout)
             # Call α
             self.fcalpha = nn.Linear(rho_size, num_topics, bias=False)
             self.bnalpha = nn.BatchNorm1d(num_topics, affine=False)
@@ -103,7 +105,7 @@ class Decoder(nn.Module):
         else:
             # Call β, Use Original NN (K->V)
             self.fcbeta = nn.Parameter(torch.randn(num_times, num_topics, vocab_size).to(device))
-            # self.bnbeta = nn.BatchNorm1d(vocab_size, affine=False)
+            print(f'beta shape: {self.fcbeta.shape}')
 
         self.bn = nn.BatchNorm1d(vocab_size, affine=False)
 
@@ -126,7 +128,7 @@ class Decoder(nn.Module):
         elif self.useEmbedding:
             beta = self.bnalpha(self.fcalpha(self.bnrho(self.fcrho.weight()))).transpose(1, 0).to(device)
         else:
-            beta = self.fcbeta.weight
+            beta = self.fcbeta.softmax(-1)
         return beta
 
 
@@ -240,6 +242,26 @@ class DTMTIR(nn.Module):
         kl_alpha = torch.stack(kl_alpha).sum()
         return alphas, kl_alpha.sum()
 
+    # Compute η[t]~N(η[t-1], δ^2*I), η[0]=
+    def get_eta(self, eta_inp):
+        etas = torch.zeros(self.num_times, self.num_topics).to(device)
+        kl_eta = []
+        inp_0 = eta_inp[0]#torch.cat([eta_inp[0], torch.zeros(self.num_topics, ).to(device)], dim=0).to(device)
+        mu_0, logsigma_0 = self.mu_q_eta(inp_0), self.logsigma_q_eta(inp_0)
+        etas[0] = self.reparameterize(mu_0, logsigma_0)
+        p_mu_0, logsigma_p_0 = torch.zeros(self.num_topics, ).to(device), torch.zeros(self.num_topics, ).to(device)
+        kl_0 = self.get_kl(mu_0, logsigma_0, p_mu_0, logsigma_p_0)
+        kl_eta.append(kl_0)
+        for t in range(1, self.num_times):
+            inp_t = eta_inp[t]#torch.cat([eta_inp[t], etas[t - 1]], dim=0)
+            mu_t, logsigma_t = self.mu_q_eta(inp_t), self.logsigma_q_eta(inp_t)
+            etas[t] = self.reparameterize(mu_t, logsigma_t)
+            logsigma_p_t = torch.log(self.delta * torch.ones(self.num_topics,).to(device))
+            kl_t = self.get_kl(mu_t, logsigma_t, etas[t - 1], logsigma_p_t)
+            kl_eta.append(kl_t)
+        kl_eta = torch.stack(kl_eta).sum()
+        return etas, kl_eta
+
     def init_hidden(self):
         """Initializes the first hidden state of the RNN used as inference network for \eta.
         """
@@ -261,10 +283,9 @@ class DTMTIR(nn.Module):
         coeff = num_docs / bsz
         # eta, kl_eta = self.get_eta(rnn_inp)
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
-        kld_eta = torch.zeros(()).to(device)
         # eta, kld_eta = self.get_eta(eta_gp.to(device))
         # get theta N(η,α^2I)
-        theta, kld_theta = self.get_theta(self.eta, norm_bows, times)
+        theta, kld_theta = self.get_theta(eta_gp, norm_bows, times)
         kld_theta = kld_theta.sum() * coeff
         alpha, kl_alpha = self.get_alpha()
         assert (alpha.shape == torch.Size(
@@ -299,8 +320,8 @@ class DTMTIR(nn.Module):
         self.eval()
         with torch.no_grad():
             # get eta(TxK)
-            # eta = self.gplvm.X.q_mu
-            eta = self.eta
+            eta = self.gplvm.X.q_mu
+            # eta = self.eta
             # eta, kl_eta = self.get_eta(rnn_inp)
             assert (eta.shape == torch.Size([self.num_times, self.num_topics]))
             # get theta(DxK)

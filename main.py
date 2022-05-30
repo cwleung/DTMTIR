@@ -45,6 +45,7 @@ parser.add_argument("-eta", "--eta-size", default=128, type=int)
 parser.add_argument("-e", "--epoch", default=20, type=int)
 
 parser.add_argument("-l", "--lambda_", default=1, type=float)
+parser.add_argument("-es", "--early-stopping", default=True, type=bool)
 
 args = parser.parse_args()
 

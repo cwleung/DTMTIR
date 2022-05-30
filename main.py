@@ -1,189 +1,89 @@
+import argparse
+from doctest import set_unittest_reportflags
 import os
 import pickle
-
+import torch
+import math
 import numpy as np
 import scipy.io
 import torch
 from tqdm import trange
 
-from model.dtmtir import TETM
+from model.dtmtir import DTMTIR
+from utils.data import get_batch, get_data, get_rnn_input
+from utils.util import get_rnn_inp, get_topic_coherence, set_seed
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+parser = argparse.ArgumentParser(description="Dynamic Topic Model with Temporal Information Regularizer")
+# Environment setting
+parser.add_argument("-st", "--smoke-test", default=False, type=bool)
+parser.add_argument("-s", "--seed", default=2022, type=int)
+# Topic model-related
+parser.add_argument("-nt", "--num-topics", default=20, type=int)
+# NN-related
+parser.add_argument("-hl", "--inf-hidden", default=800, type=int)
+parser.add_argument("-dr", "--dropout", default=0.0, type=float)
+parser.add_argument("-af", "--batch-norm", default=True, type=bool)
+parser.add_argument("-temb", "--train-embedding", default=False, type=bool)
+parser.add_argument("-uemb", "--use-embedding", default=False, type=bool)
+# Dataset-related
+# parser.add_argument("-ds", "--dataset", default="20newsgroups", type=str)
+parser.add_argument("-nd", "--min-df", default=50, type=int)
+parser.add_argument("-xd", "--max-df", default=0.7, type=float)
+parser.add_argument("-bz", "--batch-size", default=256, type=int)
+parser.add_argument("-tr", "--test-ratio", default=0.8, type=int)
+# Adam related
+parser.add_argument("-lr", "--learning-rate", default=5e-3, type=float)
+parser.add_argument("-wd", "--weight-decay", default=1e-6, type=float)
+#
+parser.add_argument("-emb", "--embedding", default="NN", type=str)
+parser.add_argument("-d", "--delta", default=0.005, type=float)
+parser.add_argument("-rho", "--rho-size", default=300, type=int)
+parser.add_argument("-eta", "--eta-size", default=128, type=int)
 
-def _fetch(path, name):
-    if name == 'train':
-        token_file = os.path.join(path, 'bow_tr_tokens')
-        count_file = os.path.join(path, 'bow_tr_counts')
-    elif name == 'valid':
-        token_file = os.path.join(path, 'bow_va_tokens')
-        count_file = os.path.join(path, 'bow_va_counts')
-    else:
-        token_file = os.path.join(path, 'bow_ts_tokens')
-        count_file = os.path.join(path, 'bow_ts_counts')
-    tokens = scipy.io.loadmat(token_file)['tokens'].squeeze()
-    counts = scipy.io.loadmat(count_file)['counts'].squeeze()
-    if name == 'test':
-        token_1_file = os.path.join(path, 'bow_ts_h1_tokens')
-        count_1_file = os.path.join(path, 'bow_ts_h1_counts')
-        token_2_file = os.path.join(path, 'bow_ts_h2_tokens')
-        count_2_file = os.path.join(path, 'bow_ts_h2_counts')
-        tokens_1 = scipy.io.loadmat(token_1_file)['tokens'].squeeze()
-        counts_1 = scipy.io.loadmat(count_1_file)['counts'].squeeze()
-        tokens_2 = scipy.io.loadmat(token_2_file)['tokens'].squeeze()
-        counts_2 = scipy.io.loadmat(count_2_file)['counts'].squeeze()
-        return {'tokens': tokens, 'counts': counts, 'tokens_1': tokens_1, 'counts_1': counts_1, 'tokens_2': tokens_2,
-                'counts_2': counts_2}
-    return {'tokens': tokens, 'counts': counts}
+parser.add_argument("-e", "--epoch", default=20, type=int)
 
+parser.add_argument("-l", "--lambda_", default=1, type=float)
 
-def _fetch_temporal(path, name):
-    if name == 'train':
-        token_file = os.path.join(path, 'bow_tr_tokens')
-        count_file = os.path.join(path, 'bow_tr_counts')
-        time_file = os.path.join(path, 'bow_tr_timestamps')
-    elif name == 'valid':
-        token_file = os.path.join(path, 'bow_va_tokens')
-        count_file = os.path.join(path, 'bow_va_counts')
-        time_file = os.path.join(path, 'bow_va_timestamps')
-    else:
-        token_file = os.path.join(path, 'bow_ts_tokens')
-        count_file = os.path.join(path, 'bow_ts_counts')
-        time_file = os.path.join(path, 'bow_ts_timestamps')
-    tokens = scipy.io.loadmat(token_file)['tokens'].squeeze()
-    counts = scipy.io.loadmat(count_file)['counts'].squeeze()
-    times = scipy.io.loadmat(time_file)['timestamps'].squeeze()
-    if name == 'test':
-        token_1_file = os.path.join(path, 'bow_ts_h1_tokens')
-        count_1_file = os.path.join(path, 'bow_ts_h1_counts')
-        token_2_file = os.path.join(path, 'bow_ts_h2_tokens')
-        count_2_file = os.path.join(path, 'bow_ts_h2_counts')
-        tokens_1 = scipy.io.loadmat(token_1_file)['tokens'].squeeze()
-        counts_1 = scipy.io.loadmat(count_1_file)['counts'].squeeze()
-        tokens_2 = scipy.io.loadmat(token_2_file)['tokens'].squeeze()
-        counts_2 = scipy.io.loadmat(count_2_file)['counts'].squeeze()
-        return {'tokens': tokens, 'counts': counts, 'times': times,
-                'tokens_1': tokens_1, 'counts_1': counts_1,
-                'tokens_2': tokens_2, 'counts_2': counts_2}
-    return {'tokens': tokens, 'counts': counts, 'times': times}
+args = parser.parse_args()
 
-
-def get_data(path, temporal=False):
-    ### load vocabulary
-    with open(os.path.join(path, 'vocab.pkl'), 'rb') as f:
-        vocab = pickle.load(f)
-
-    if not temporal:
-        train = _fetch(path, 'train')
-        valid = _fetch(path, 'valid')
-        test = _fetch(path, 'test')
-    else:
-        train = _fetch_temporal(path, 'train')
-        valid = _fetch_temporal(path, 'valid')
-        test = _fetch_temporal(path, 'test')
-
-    return vocab, train, valid, test
-
-
-def get_batch(tokens, counts, ind, vocab_size, temporal=False, times=None):
-    """fetch input data by batch."""
-    batch_size = len(ind)
-    data_batch = np.zeros((batch_size, vocab_size))
-    if temporal:
-        times_batch = np.zeros((batch_size,))
-    for i, doc_id in enumerate(ind):
-        doc = tokens[doc_id]
-        count = counts[doc_id]
-        if temporal:
-            timestamp = times[doc_id]
-            times_batch[i] = timestamp
-        L = count.shape[1]
-        if len(doc) == 1:
-            doc = [doc.squeeze()]
-            count = [count.squeeze()]
-        else:
-            doc = doc.squeeze()
-            count = count.squeeze()
-        if doc_id != -1:
-            for j, word in enumerate(doc):
-                data_batch[i, word] = count[j]
-    data_batch = torch.from_numpy(data_batch).float().to(device)
-    if temporal:
-        times_batch = torch.from_numpy(times_batch).to(device)
-        return data_batch, times_batch
-    return data_batch
-
-
-def get_rnn_input(tokens, counts, times, num_times, vocab_size, num_docs):
-    # (data_batch,times_batch, num_times, vocab_size):
-    ind = torch.randperm(num_docs).to(device)
-    data_batch, times_batch = get_batch(tokens, counts, ind, vocab_size, temporal=True, times=times)
-    rnn_input = torch.zeros(num_times, vocab_size).to(device)
-    cnt = torch.zeros(num_times, ).to(device)
-    for t in range(num_times):
-        tmp = (times_batch == t).nonzero()
-        docs = data_batch[tmp].squeeze().sum(0)
-        rnn_input[t] += docs
-        cnt[t] += tmp.shape[0]
-    rnn_input = rnn_input / cnt.unsqueeze(1)
-    return rnn_input
-
+torch.set_default_tensor_type('torch.FloatTensor')
+# set seed
+set_seed(args.seed)
 
 print('Getting vocabulary ...')
 data_file = os.path.join('./', 'min_df_{}'.format(100))
 vocab, train, valid, test = get_data(data_file, temporal=True)
 vocab_size = len(vocab)
-
 # 1. training data
 print('Getting training data ...')
 train_tokens = train['tokens']
 train_counts = train['counts']
 train_times = train['times']
-num_times = train_times.max() - train_times.min() + 1  # len(np.unique(train_times))
-num_docs_train = len(train_tokens)
-
-batch_size = 1024
-test_ratio = 0.8
-train_size = int(np.floor(test_ratio * len(train_tokens)))
-test_size = int(np.floor(0.15 * len(train_tokens)))
-# test_size = test_size-(test_size%batch_size)
-valid_size = len(train_tokens) - train_size - test_size
-
-# 2. dev set
+# 2. valid set
 print('Getting validation data ...')
 valid_tokens = valid['tokens']
 valid_counts = valid['counts']
 valid_times = valid['times']
-num_docs_valid = len(valid_tokens)
-valid_rnn_inp = get_rnn_input(
-    valid_tokens, valid_counts, valid_times, num_times, vocab_size, valid_size).nan_to_num()
-
 # 3. test data
 print('Getting testing data ...')
 test_tokens = test['tokens']
 test_counts = test['counts']
 test_times = test['times']
-num_docs_test = len(test_tokens)
-test_rnn_inp = get_rnn_input(
-    test_tokens, test_counts, test_times, num_times, vocab_size, test_size).nan_to_num()
 
-train_rnn_inp = get_rnn_input(
-    train_tokens, train_counts, train_times, num_times, vocab_size, train_size).nan_to_num()
+num_times = train_times.max() - train_times.min() + 1
+train_size = len(train_tokens)
+valid_size = len(valid_tokens)
+test_size = len(test_tokens)
 
-# %%
+test_rnn_inp = get_rnn_input(test_tokens, test_counts, test_times, num_times, vocab_size, test_size).nan_to_num()
+valid_rnn_inp = get_rnn_input(valid_tokens, valid_counts, valid_times, num_times, vocab_size, valid_size).nan_to_num()
+train_rnn_inp = get_rnn_input(train_tokens, train_counts, train_times, num_times, vocab_size, train_size).nan_to_num()
 
-train_cvz, train_ts = get_batch(
-    train_tokens, train_counts, torch.tensor(range(train_size)).to(device), vocab_size, temporal=True,
-    times=train_times)
-valid_cvz, valid_ts = get_batch(
-    valid_tokens, valid_counts, torch.tensor(range(valid_size)).to(device), vocab_size, temporal=True,
-    times=valid_times)
-test_cvz, test_ts = get_batch(
-    test_tokens, test_counts, torch.tensor(range(test_size)).to(device), vocab_size, temporal=True, times=test_times)
-
-
-import torch
-import math
+train_cvz, train_ts = get_batch(train_tokens, train_counts, torch.tensor(range(train_size)).to(device), vocab_size, temporal=True,times=train_times)
+valid_cvz, valid_ts = get_batch(valid_tokens, valid_counts, torch.tensor(range(valid_size)).to(device), vocab_size, temporal=True,times=valid_times)
+test_cvz, test_ts = get_batch(test_tokens, test_counts, torch.tensor(range(test_size)).to(device), vocab_size, temporal=True, times=test_times)
 
 
 def evaluate(model):
@@ -191,39 +91,15 @@ def evaluate(model):
     alpha = model.mu_q_alpha.clone().contiguous()  # KxTxL
     alpha = alpha.permute(1, 0, 2)
     beta = model.get_beta(alpha)
-    beta = beta[:, :, :-3]
     cnt = 0
     tc = 0
     for time in range(0, beta.shape[0]):
         beta_t = beta[time, :, :]
         cnt += 1
-        tc += get_topic_coherence(beta_t, cvz)
+        tc += get_topic_coherence(beta_t, train_cvz)
     tc /= cnt
     print(f'tc: {tc}')
 
-
-torch.set_default_tensor_type('torch.FloatTensor')
-# get index first
-# train_rnn_inp = get_rnn_inp(train_cvz.to(device), train_ts.to(device), len(times), train_cvz.shape[1])
-# test_rnn_inp = get_rnn_inp(test_cvz.to(device), test_ts.to(device), len(times), test_cvz.shape[1])
-# valid_rnn_inp = get_rnn_inp(valid_cvz.to(device), valid_ts.to(device), len(times), valid_cvz.shape[1])
-# define model
-model = TETM(vocab_size=cvz.shape[1],
-             num_topics=30,
-             num_times=len(times),
-             hidden=800,
-             dropout=0.0,
-             delta=0.005,
-             emb_type='NN',
-             useEmbedding=True,
-             trainEmbedding=True,
-             rho_size=300,
-             eta_size=128,
-             data_size=train_rnn_inp.shape[0]
-             )
-
-
-# print_top_words(beta[:,:,:-3],vocab)
 def _diversity_helper(beta, num_tops):
     list_w = torch.zeros((int(beta.shape[0]), num_tops))
     for k in range(int(beta.shape[0])):
@@ -235,53 +111,48 @@ def _diversity_helper(beta, num_tops):
     diversity = n_unique / (beta.shape[0] * num_tops)
     return diversity
 
-
-# https://stackoverflow.com/questions/49201236/check-the-total-number-of-parameters-in-a-pytorch-model
-from prettytable import PrettyTable
-
-
-def count_parameters(model):
-    table = PrettyTable(["Modules", "Parameters"])
-    total_params = 0
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad: continue
-        param = parameter.numel()
-        table.add_row([name, param])
-        total_params += param
-    print(table)
-    print(f"Total Trainable Params: {total_params}")
-    return total_params
-
+# define model
+model = DTMTIR(vocab_size=vocab_size,
+             num_topics=args.num_topics,
+             num_times=num_times,
+             hidden=args.inf_hidden,
+             dropout=args.dropout,
+             delta=args.delta,
+             emb_type=args.embedding,
+             useEmbedding=args.use_embedding,
+             trainEmbedding=args.train_embedding,
+             rho_size=args.rho_size,
+             eta_size=args.eta_size,
+             data_size=train_rnn_inp.shape[0]
+             )
 
 # print model parameters
 # count_parameters(model)
-print(model)
 
-num_epochs = 1000
+batch_size = args.batch_size
+
+num_epochs = args.epoch
 bar = trange(num_epochs)
 
-# dataloader loop
-# ODO save the loss/batch-loss
-# - reconstruction loss
-recon_loss_trace = []
-# - kl-loss
-kl_loss_trace = []
-# - transformer loss
-trans_loss_trace = []
-# - combined loss, can be done with post-processing
-combined_loss_trace = []
-# - validation perplexity
-val_ppl_trace = []
+# early stopping
 
 num_batches = int(math.ceil(train_cvz.shape[0] / batch_size))
-optim = torch.optim.Adam(model.parameters(), lr=5e-3, weight_decay=1e-6)
+optim = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+
+# iteration loop
+recon_loss_trace = []
+kl_loss_trace = []
+combined_loss_trace = []
+val_ppl_trace = []
 for epoch in bar:
+    
     batch_recon_loss = []
     batch_kl_loss = []
     batch_trans_loss = []
+    
     for i in range(num_batches):
         model.train()
-        model.zero_grad()
+        # model.zero_grad()
         optim.zero_grad()
 
         if (i + 1) * batch_size > len(train_cvz):
@@ -290,24 +161,25 @@ for epoch in bar:
         else:
             batch_docs = train_cvz[i * batch_size:(i + 1) * batch_size, :]
             time_batch = train_ts[i * batch_size:(i + 1) * batch_size]
-        batch_docs = batch_docs.nan_to_num()
+
         # normalize batch
         sums = batch_docs.sum(1).unsqueeze(1)
-        normalized_data_batch = batch_docs  # / sums
-        # Calculate loss of transformer model
-        recon_loss, kl_alpha, kl_eta, kl_theta, kld_eta_gp = model(batch_docs, normalized_data_batch, time_batch,
-                                                                   train_rnn_inp, len(train_cvz))
+        
+        # Calculate loss of model
+        recon_loss, kl_alpha, kl_theta, kld_eta_gp = model(
+            batch_docs, batch_docs, time_batch,
+            train_rnn_inp, len(train_cvz))
+        
         # scale the product
         bsz = batch_docs.size(0)
-        # coeff = len(cvz) / bsz
-        kl_loss = recon_loss + kl_alpha + kl_theta + kl_eta - 0.5 * kld_eta_gp
+        kl_loss = recon_loss + kl_alpha + kl_theta + kld_eta_gp * args.lambda_
         kl_loss = kl_loss.sum()
         # optimizer
         batch_loss = kl_loss  # + recon_loss
         bar.set_postfix(recon='{:.5e}'.format(recon_loss),
                         alpha='{:.2e}'.format(kl_alpha),
                         theta='{:.2e}'.format(kl_theta.sum()),
-                        eta='{:.2e}'.format(kl_eta.sum()))
+                        kld_gp='{:.2e}'.format(kld_eta_gp.sum()))
 
         # gradient step
         batch_loss.backward()
@@ -340,11 +212,10 @@ for epoch in bar:
         tc /= cnt
         print(f'tc: {tc}')
 
+    # evaluation
     model.eval()
-    sums = valid_cvz.sum(1).unsqueeze(1)
-    valid_cvz = valid_cvz.nan_to_num()
-    normalized_valid_batch = valid_cvz.nan_to_num()  # / sums
-    ppl = model.predict(valid_cvz, normalized_valid_batch, valid_ts.nan_to_num(), valid_rnn_inp.nan_to_num())
+    ppl = model.predict(valid_cvz, valid_cvz, valid_ts, valid_rnn_inp)
+
     print(f'Validation perplexity: {ppl}')
     val_ppl_trace.append(ppl)
     # KxTxL
@@ -356,26 +227,8 @@ for epoch in bar:
         td += d
     print(f'TD: {td / beta.shape[0]}')
 
+# validation perplexity
 model.eval()
-print(test_cvz.shape)
-test_cvz = test_cvz.nan_to_num().float()
-normalized_test_batch = test_cvz  # / sums
-ppl = model.predict(test_cvz, normalized_test_batch, test_ts, test_rnn_inp.nan_to_num())
+test_cvz = test_cvz.float()
+ppl = model.predict(test_cvz, test_cvz, test_ts, test_rnn_inp)
 print(f'Validation perplexity: {ppl}')
-
-# %%
-
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=256, num_workers=1, shuffle=False)
-# test_rnn_inp = get_rnn_input(test_loader, len(ts.unique()),cvz.shape[1]).cuda().nan_to_num(0)
-print(d_batch, t_batch, len(dataset))
-
-test_ppl = 0
-test_cnt = 0
-for data in test_loader:
-    d_batch, t_batch = cvz[data['index'] - 1, :].to(device), ts[data['index'] - 1].to(device)
-    test_rnn_inp = get_rnn_inp(d_batch, t_batch, len(ts.unique()), cvz.shape[1]).cuda().nan_to_num(0)
-    test_ppl += model.predict(d_batch, t_batch, test_rnn_inp)
-    test_cnt += 1
-# perplexity
-test_ppl /= test_cnt
-print(f'Test perplpexity: {test_ppl}')

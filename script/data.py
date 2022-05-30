@@ -121,7 +121,7 @@ idx_permute = np.random.permutation(num_docs).astype(int)
 # vocab = list(set([w for idx_d in range(trSize) for w in docs[idx_permute[idx_d]].split() if w in word2id]))
 # word2id = dict([(w, j) for j, w in enumerate(vocab)])
 # id2word = dict([(j, w) for j, w in enumerate(vocab)])
-print('  vocabulary after removing words not in train: {}'.format(len(vocab)))
+print('vocabulary after removing words not in train: {}'.format(len(vocab)))
 
 docs_tr = [[word2id[w] for w in docs[idx_permute[idx_d]].split() if w in word2id] for idx_d in range(trSize)]
 timestamps_tr = [time2id[timestamps[idx_permute[idx_d]]] for idx_d in range(trSize)]

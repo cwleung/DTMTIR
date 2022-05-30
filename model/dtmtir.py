@@ -1,17 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions.constraints import positive
-from torch.utils.data import Dataset
-
-import torch
-import numpy as np
-
-from gpytorch.distributions import MultivariateNormal
-from gpytorch.means import ZeroMean
 from gpytorch.models.gplvm.latent_variable import *
-from gpytorch.priors import NormalPrior
-from gpytorch.variational import VariationalStrategy
+import math
 
 from model.gplvm import bGPLVM
 
@@ -97,7 +88,6 @@ class Decoder(nn.Module):
         self.drop = nn.Dropout(dropout)
         if self.useEmbedding:
             # Call ρ Topic Embedding
-
             if trainEmbedding:
                 self.fcrho = TopicEmbedding(rho_size, vocab_size, pre_embedding,
                                             emb_type, dropout)
@@ -162,7 +152,7 @@ class TopicEmbedding(nn.Module):
             raise ValueError('Wrong Embedding Type')
 
 
-class TETM(nn.Module):
+class DTMTIR(nn.Module):
 
     def __init__(self, vocab_size, num_topics, num_times, hidden, dropout,
                  delta, data_size, useEmbedding=False, eta_size=256, rho_size=256,
@@ -177,6 +167,7 @@ class TETM(nn.Module):
         self.num_topics = num_topics
         self.num_times = num_times
         self.useEmbedding = useEmbedding
+        self.trainEmbedding = trainEmbedding
         self.emb_type = emb_type
         self.rho_size = rho_size
         self.eta_size = eta_size
@@ -249,26 +240,6 @@ class TETM(nn.Module):
         kl_alpha = torch.stack(kl_alpha).sum()
         return alphas, kl_alpha.sum()
 
-    # Compute η[t]~N(η[t-1], δ^2*I), η[0]=
-    def get_eta(self, eta_inp):
-        etas = torch.zeros(self.num_times, self.num_topics).to(device)
-        kl_eta = []
-        inp_0 = eta_inp[0]  # torch.cat([eta_inp[0], torch.zeros(self.num_topics, ).to(device)], dim=0).to(device)
-        mu_0, logsigma_0 = self.mu_q_eta(inp_0), self.logsigma_q_eta(inp_0)
-        etas[0] = self.reparameterize(mu_0, logsigma_0)
-        p_mu_0, logsigma_p_0 = torch.zeros(self.num_topics, ).to(device), torch.zeros(self.num_topics, ).to(device)
-        kl_0 = self.get_kl(mu_0, logsigma_0, p_mu_0, logsigma_p_0)
-        kl_eta.append(kl_0)
-        for t in range(1, self.num_times):
-            inp_t = eta_inp[t]  # torch.cat([eta_inp[t], etas[t - 1]], dim=0)
-            mu_t, logsigma_t = self.mu_q_eta(inp_t), self.logsigma_q_eta(inp_t)
-            etas[t] = self.reparameterize(mu_t, logsigma_t)
-            logsigma_p_t = torch.log(self.delta * torch.ones(self.num_topics, ).to(device))
-            kl_t = self.get_kl(mu_t, logsigma_t, etas[t - 1], logsigma_p_t)
-            kl_eta.append(kl_t)
-        kl_eta = torch.stack(kl_eta).sum()
-        return etas, kl_eta
-
     def init_hidden(self):
         """Initializes the first hidden state of the RNN used as inference network for \eta.
         """
@@ -289,7 +260,7 @@ class TETM(nn.Module):
         bsz = bows.size(0)
         coeff = num_docs / bsz
         # eta, kl_eta = self.get_eta(rnn_inp)
-        # eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
+        eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
         kld_eta = torch.zeros(()).to(device)
         # eta, kld_eta = self.get_eta(eta_gp.to(device))
         # get theta N(η,α^2I)
@@ -312,7 +283,7 @@ class TETM(nn.Module):
         logp = torch.log(pred + 1e-6).nan_to_num()
         nll = -(logp * bows).sum(-1)
         nll = nll.sum() * coeff
-        return nll, kl_alpha, kld_eta, kld_theta, 0  # kld_eta_gp
+        return nll, kl_alpha, kld_theta, kld_eta_gp
 
     def get_beta_result(self):
         alpha = self.mu_q_alpha.clone().contiguous()
@@ -351,7 +322,8 @@ class TETM(nn.Module):
             #             ))
             # get beta(T[D]xKxV)
             beta = self.get_beta(alpha)
-            beta = beta.permute(1, 0, 2)
+            if self.trainEmbedding or self.useEmbedding:
+                beta = beta.permute(1, 0, 2)
             beta = beta[t_bat.type('torch.LongTensor')]
             assert (beta.shape == torch.Size(
                 [d_bat.shape[0], self.num_topics, self.vocab_size]

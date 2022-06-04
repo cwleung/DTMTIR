@@ -2,6 +2,8 @@ import gpytorch
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gpytorch.likelihoods import GaussianLikelihood
+from gpytorch.mlls import VariationalELBO
 from gpytorch.models.gplvm.latent_variable import *
 import math
 
@@ -32,7 +34,6 @@ class Encoder(nn.Module):
         self.bnmu = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
         self.bnlv = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
 
-        
     def get_kl(self, q_mu, q_logsigma, p_mu=None, p_logsigma=None):
         """ Gaussian KL Divergence
         Returns KL( N(q_mu, q_logsigma) || N(p_mu, p_logsigma) ).
@@ -76,139 +77,37 @@ class Decoder(nn.Module):
     # Pre-trained embedding, alpha, rho, embedding method
     # Need to be refactored with Topic Embedding
     def __init__(self, vocab_size, num_topics, num_times, dropout,
-                 useEmbedding=True, rho_size=256, pre_embedding=None, emb_type='NN',
-                 trainEmbedding=True):
+                 useEmbedding=True, rho_size=256, delta=0.005):
         super().__init__()
         # this beta can be refactorized in to BOW, a neural network that to be trained
-        self.emb_type = emb_type
-        self.trainEmbedding = trainEmbedding
+        self.delta = delta
+        self.vocab_size = vocab_size
+        self.num_topics = num_topics
+        self.num_times = num_times
         self.useEmbedding = useEmbedding
         self.rho_size = rho_size
         # Changes - Beta
         # < Linear NN (K->V)
         # > Embedding -> Linear NN (K->E->V)
-        self.drop = nn.Dropout(dropout)
         if self.useEmbedding:
             # Call ρ Topic Embedding
-            if trainEmbedding:
-                self.fcrho = TopicEmbedding(rho_size, vocab_size, pre_embedding,
-                                            emb_type, dropout)
-                self.bnrho = nn.BatchNorm1d(rho_size, affine=False)
-            # use original embedding
-            else:
-                self.fcrho = TopicEmbedding(rho_size, vocab_size, pre_embedding,
-                                            emb_type, dropout)
-            # Call α
-            self.fcalpha = nn.Linear(rho_size, num_topics, bias=False)
-            self.bnalpha = nn.BatchNorm1d(num_topics, affine=False)
-            # nn.Parameter(torch.randn(rho_size, num_topics))
+            self.fcrho = nn.Linear(rho_size, vocab_size, bias=False)
+            self.bnrho = nn.BatchNorm1d(rho_size, affine=False)
+            ## define the variational parameters for the topic embeddings over time (alpha) ... alpha is K x T x L
+            self.mu_q_alpha = nn.Parameter(torch.randn(num_topics, num_times, rho_size).to(device))
+            self.logsigma_q_alpha = nn.Parameter(torch.randn(num_topics, num_times, rho_size).to(device))
         else:
-            # Call β, Use Original NN (K->V)
-            self.fcbeta = nn.Parameter(torch.randn(num_times, num_topics, vocab_size).to(device))
-            print(f'beta shape: {self.fcbeta.shape}')
-
-        self.bn = nn.BatchNorm1d(vocab_size, affine=False)
+            # beta
+            self.mu_q_beta = nn.Parameter(torch.randn(num_topics, num_times, vocab_size).to(device))
+            self.logsig_q_beta = nn.Parameter(torch.randn(num_topics, num_times, vocab_size).to(device))
 
         if torch.cuda.is_available():
             self.cuda()
-
-    def get_beta(self, alpha):
-        if self.trainEmbedding:
-            if self.emb_type is 'NN':
-                #                 logit = self.fcrho(alpha.reshape(alpha.size(0) * alpha.size(1), self.rho_size))
-                #                 logit = logit.reshape(alpha.size(0), alpha.size(1), -1)
-                #                 beta = F.softmax(logit, dim=-1)
-                n_alpha = alpha.reshape(alpha.size(0) * alpha.size(1), self.rho_size)
-                rho = self.fcrho.rho.weight.T
-                logit = torch.mm(n_alpha, rho)
-                logit = logit.reshape(alpha.size(0), alpha.size(1), -1)
-                beta = F.softmax(logit, dim=-1)
-            else:
-                raise ValueError('Wrong embedding type')
-        elif self.useEmbedding:
-            beta = self.bnalpha(self.fcalpha(self.bnrho(self.fcrho.weight()))).transpose(1, 0).to(device)
-        else:
-            beta = self.fcbeta.softmax(-1)
-        return beta
-
-
-class TopicEmbedding(nn.Module):
-    def __init__(self, rho_size, vocab_size, pre_embedding=None,
-                 emb_type='NN', dropout=0.0,
-                 n_heads=8, n_layer=4, n_dim=128, n_code=8):
-        super().__init__()
-        self.emb_type = emb_type
-        if pre_embedding is None:
-            # 1. Embedding layer
-            if emb_type is 'NN':
-                self.rho = nn.Linear(rho_size, vocab_size, bias=False)
-            else:
-                raise ValueError('Wrong Embedding Type')
-        else:
-            self.rho = pre_embedding.clone().float().to(device)
-
-    def forward(self, inputs):
-        if self.emb_type is 'NN':
-            return self.rho(inputs)
-        else:
-            raise ValueError('Wrong Embedding Type')
-
-
-class DTMTIR(nn.Module):
-
-    def __init__(self, vocab_size, num_topics, num_times, hidden, dropout,
-                 delta, data_size, useEmbedding=False, eta_size=256, rho_size=256,
-                 pre_embedding=None, emb_type='NN', trainEmbedding=False, batchNorm=True):
-        super().__init__()
-
-        self.delta = delta
-        if torch.cuda.is_available():
-            self.cuda()
-
-        self.vocab_size = vocab_size
-        self.num_topics = num_topics
-        self.num_times = num_times
-        self.useEmbedding = useEmbedding
-        self.trainEmbedding = trainEmbedding
-        self.emb_type = emb_type
-        self.rho_size = rho_size
-        self.eta_size = eta_size
-
-        self.encoder = Encoder(vocab_size, num_topics, hidden, dropout, batchNorm).to(device)
-        self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
-                               useEmbedding, rho_size, pre_embedding, emb_type,
-                               trainEmbedding).to(device)
-        ## define the variational parameters for the topic embeddings over time (alpha) ... alpha is K x T x L
-        self.mu_q_alpha = nn.Parameter(torch.randn(num_topics, num_times, rho_size).to(device))
-        self.logsigma_q_alpha = nn.Parameter(torch.randn(num_topics, num_times, rho_size).to(device))
-
-        self.data_size = data_size
-        self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
-        self.likelihood = GaussianLikelihood(batch_shape=(num_times, vocab_size)).to(device)
-
-        self.mu_q_eta = nn.Linear(self.num_topics, self.num_topics, bias=True).to(device)
-        self.logsigma_q_eta = nn.Linear(self.num_topics, self.num_topics, bias=True).to(device)
-
-        self.eta = nn.Parameter(torch.randn(self.num_times, self.num_topics).to(device))
 
     def reparameterize(self, mu, logvar):
         std = torch.exp(0.5 * logvar).to(device)
         eps = torch.randn_like(std).to(device)
         return eps.mul_(std).add_(mu)
-
-    def get_beta(self, alpha):
-        beta = self.decoder.get_beta(alpha)
-        return beta
-
-    def get_theta(self, eta, bows, times):
-        eta_td = eta[times.type('torch.LongTensor')]
-        theta, kl_theta = self.encoder(bows, eta_td)
-        return theta, kl_theta
-
-    def decode(self, theta, beta):
-        res = torch.mm(theta, beta)
-        preds = torch.log(res + 1e-6)
-        return preds
 
     def get_kl(self, q_mu, q_logsigma, p_mu=None, p_logsigma=None):
         """ Gaussian KL Divergence
@@ -224,8 +123,7 @@ class DTMTIR(nn.Module):
             kl = -0.5 * torch.sum(1 + q_logsigma - q_mu.pow(2) - q_logsigma.exp(), dim=-1).to(device)
         return kl
 
-    def get_alpha(self):  ## mean field
-        # TxKxL
+    def get_alpha_ssm(self):
         alphas = torch.zeros(self.num_times, self.num_topics, self.rho_size).to(device)
         kl_alpha = []
         alphas[0] = self.reparameterize(self.mu_q_alpha[:, 0, :], self.logsigma_q_alpha[:, 0, :])
@@ -240,35 +138,85 @@ class DTMTIR(nn.Module):
             kl_t = self.get_kl(self.mu_q_alpha[:, t, :], self.logsigma_q_alpha[:, t, :], p_mu_t, logsigma_p_t)
             kl_alpha.append(kl_t)
         kl_alpha = torch.stack(kl_alpha).sum()
+        assert (alphas.shape == torch.Size([self.num_times, self.num_topics, self.rho_size]))
         return alphas, kl_alpha.sum()
 
-    # Compute η[t]~N(η[t-1], δ^2*I), η[0]=
-    def get_eta(self, eta_inp):
-        etas = torch.zeros(self.num_times, self.num_topics).to(device)
-        kl_eta = []
-        inp_0 = eta_inp[0]#torch.cat([eta_inp[0], torch.zeros(self.num_topics, ).to(device)], dim=0).to(device)
-        mu_0, logsigma_0 = self.mu_q_eta(inp_0), self.logsigma_q_eta(inp_0)
-        etas[0] = self.reparameterize(mu_0, logsigma_0)
-        p_mu_0, logsigma_p_0 = torch.zeros(self.num_topics, ).to(device), torch.zeros(self.num_topics, ).to(device)
-        kl_0 = self.get_kl(mu_0, logsigma_0, p_mu_0, logsigma_p_0)
-        kl_eta.append(kl_0)
+    def get_beta_ssm(self):
+        beta = torch.zeros(self.num_times, self.num_topics, self.vocab_size).to(device)
+        kl_beta = []
+        beta[0] = self.reparameterize(self.mu_q_beta[:, 0, :], self.logsig_q_beta[:, 0, :])
+        pu_mu_0 = torch.zeros(self.num_topics, self.vocab_size).to(device)
+        logsig_p_0 = torch.zeros(self.num_topics, self.vocab_size).to(device)
+        kl_0 = self.get_kl(self.mu_q_beta[:, 0, :], self.logsig_q_beta[:, 0, :], pu_mu_0, logsig_p_0)
+        kl_beta.append(kl_0)
         for t in range(1, self.num_times):
-            inp_t = eta_inp[t]#torch.cat([eta_inp[t], etas[t - 1]], dim=0)
-            mu_t, logsigma_t = self.mu_q_eta(inp_t), self.logsigma_q_eta(inp_t)
-            etas[t] = self.reparameterize(mu_t, logsigma_t)
-            logsigma_p_t = torch.log(self.delta * torch.ones(self.num_topics,).to(device))
-            kl_t = self.get_kl(mu_t, logsigma_t, etas[t - 1], logsigma_p_t)
-            kl_eta.append(kl_t)
-        kl_eta = torch.stack(kl_eta).sum()
-        return etas, kl_eta
+            beta[t] = self.reparameterize(self.mu_q_beta[:, t, :], self.logsig_q_beta[:, t, :])
+            p_mu_t = beta[t - 1]
+            logsig_p_t = torch.log(self.delta * torch.ones(self.num_topics, self.vocab_size).to(device))
+            kl_t = self.get_kl(self.mu_q_beta[:, t, :], self.logsig_q_beta[:, t, :], p_mu_t, logsig_p_t)
+            kl_beta.append(kl_t)
+        kl_beta = torch.stack(kl_beta).sum()
 
-    def init_hidden(self):
-        """Initializes the first hidden state of the RNN used as inference network for \eta.
-        """
-        weight = next(self.parameters())
-        nlayers = self.eta_nlayers
-        nhid = self.eta_size
-        return (weight.new_zeros(nlayers, 1, nhid), weight.new_zeros(nlayers, 1, nhid))
+        assert (beta.shape == torch.Size([self.num_times, self.num_topics, self.vocab_size]))
+        return beta.softmax(-1), kl_beta.sum()
+
+    def get_beta(self):
+        # \rho^T\alpha
+        if self.useEmbedding:
+            alpha, kl_alpha = self.get_alpha_ssm()
+            beta = self.fcrho(alpha.reshape(alpha.size(0) * alpha.size(1), self.rho_size))
+            beta = beta.reshape(alpha.size(0), alpha.size(1), -1)
+            # assert dimension
+            assert (beta.shape == torch.Size([self.num_times, self.num_topics, self.vocab_size])), beta.shape
+            # n_alpha = alpha.reshape(alpha.size(0) * alpha.size(1), self.rho_size)
+            # rho = self.fcrho.rho.weight.T
+            # logit = torch.mm(n_alpha, rho)
+            # logit = logit.reshape(alpha.size(0), alpha.size(1), -1)
+            # beta = F.softmax(logit, dim=-1)
+            # beta = self.bnalpha(self.fcalpha(self.bnrho(self.fcrho.weight))).transpose(1, 0).to(device)
+            return beta.softmax(-1), kl_alpha
+        # \beta
+        else:
+            return self.get_beta_ssm()
+
+
+class DTMTIR(nn.Module):
+
+    def __init__(self, vocab_size, num_topics, num_times, hidden, dropout,
+                 delta, data_size, useEmbedding=False, eta_size=256, rho_size=256, batchNorm=True):
+        super().__init__()
+
+        if torch.cuda.is_available():
+            self.cuda()
+
+        self.delta = delta
+        self.vocab_size = vocab_size
+        self.num_topics = num_topics
+        self.num_times = num_times
+        self.useEmbedding = useEmbedding
+        self.rho_size = rho_size
+        self.eta_size = eta_size
+        self.data_size = data_size
+
+        self.encoder = Encoder(vocab_size, num_topics, hidden, dropout, batchNorm).to(device)
+        self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
+                               useEmbedding, rho_size, delta).to(device)
+        # gplvm
+        self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
+        self.likelihood = GaussianLikelihood(batch_shape=(num_times, vocab_size)).to(device)
+
+    def get_beta(self):
+        return self.decoder.get_beta()
+
+    def get_theta(self, eta, bows, times):
+        eta_td = eta[times.type('torch.LongTensor')]
+        theta, kl_theta = self.encoder(bows, eta_td)
+        return theta, kl_theta
+
+    def decode(self, theta, beta):
+        res = torch.mm(theta, beta)
+        preds = torch.log(res + 1e-6)
+        return preds
 
     def get_mu(self, rnn_inp):
         mll = VariationalELBO(self.likelihood, self.gplvm, num_data=len(rnn_inp))  # ,combine_terms=False)
@@ -276,41 +224,30 @@ class DTMTIR(nn.Module):
         output = self.gplvm(sample)
         loss = mll(output, rnn_inp.T.to(device))
         # nll + kl_x + kl_u
-        return self.gplvm.X.q_mu, loss  # loss[0].sum()+loss[1].sum()+loss[2].sum()+loss[3].sum()
+        return self.gplvm.X.q_mu, loss.sum()
 
     def forward(self, bows, norm_bows, times, rnn_inp, num_docs):
         bsz = bows.size(0)
         coeff = num_docs / bsz
-        # eta, kl_eta = self.get_eta(rnn_inp)
+        ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
-        # eta, kld_eta = self.get_eta(eta_gp.to(device))
-        # get theta N(η,α^2I)
+        # THETA N(η,α^2I)
         theta, kld_theta = self.get_theta(eta_gp, norm_bows, times)
         kld_theta = kld_theta.sum() * coeff
-        alpha, kl_alpha = self.get_alpha()
-        assert (alpha.shape == torch.Size(
-            [self.num_times, self.num_topics, self.rho_size]
-        ))
-        beta = self.get_beta(alpha)
+        # BETA
+        beta, kl_beta = self.get_beta()
         beta = beta[times.type('torch.LongTensor')]
-
         assert (beta.shape == torch.Size(
             [bows.shape[0], self.num_topics, self.vocab_size]
         ))
         theta = theta.unsqueeze(1)
-        assert (theta.shape == torch.Size([bows.shape[0], 1, self.num_topics]
-                                          ))
+        assert (theta.shape == torch.Size([bows.shape[0], 1, self.num_topics]))
+        ## PRED
         pred = torch.bmm(theta, beta).squeeze(1).nan_to_num()
         logp = torch.log(pred + 1e-6).nan_to_num()
         nll = -(logp * bows).sum(-1)
         nll = nll.sum() * coeff
-        return nll, kl_alpha, kld_theta, kld_eta_gp
-
-    def get_beta_result(self):
-        alpha = self.mu_q_alpha.clone().contiguous()
-        alpha = alpha.permute(1, 0, 2)
-        beta = self.get_beta(alpha, torch.arange(0, ts.unique().shape[0]))
-        return beta
+        return nll, kl_beta, kld_theta, kld_eta_gp
 
     def get_eta_result(self):
         return self.gplvm.X.q_mu
@@ -321,37 +258,18 @@ class DTMTIR(nn.Module):
         with torch.no_grad():
             # get eta(TxK)
             eta = self.gplvm.X.q_mu
-            # eta = self.eta
-            # eta, kl_eta = self.get_eta(rnn_inp)
             assert (eta.shape == torch.Size([self.num_times, self.num_topics]))
             # get theta(DxK)
             eta_td = eta[t_bat.type('torch.LongTensor')]
             theta = self.encoder(d_bat, eta_td, eva=True)
-            # theta = self.get_theta(eta, norm_d_bat, t_bat)[0]
             assert (theta.shape == torch.Size([norm_d_bat.shape[0], self.num_topics]))
-            # theta = theta.unsqueeze(1)
-            # get alpha(KxTxL)
-            alpha = self.mu_q_alpha.clone().contiguous()
-            # alpha = alpha.permute(1, 0, 2)
-            assert (alpha.shape == torch.Size(
-                [self.num_topics, self.num_times, self.rho_size]
-            ))
-            # alpha_td(KxDxL)
-            # alpha_td = alpha[:,t_bat.type('torch.LongTensor'), :]
-            #             assert (alpha_td.shape == torch.Size(
-            #                 [self.num_topics, d_bat.shape[0], self.rho_size]
-            #             ))
-            # get beta(T[D]xKxV)
-            beta = self.get_beta(alpha)
-            if self.trainEmbedding or self.useEmbedding:
-                beta = beta.permute(1, 0, 2)
+            beta, kl_beta = self.get_beta()
             beta = beta[t_bat.type('torch.LongTensor')]
             assert (beta.shape == torch.Size(
                 [d_bat.shape[0], self.num_topics, self.vocab_size]
             ))
             loglik = theta.unsqueeze(2) * beta
             pred = loglik.sum(1)
-            # pred = torch.bmm(theta, beta).squeeze(1)
             logp = torch.log(pred)
             sums = d_bat.sum(1).unsqueeze(1)
             loss = (-logp * d_bat).sum(-1) / sums.squeeze()

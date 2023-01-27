@@ -219,7 +219,7 @@ class DTMTIR(nn.Module):
         return preds
 
     def get_mu(self, rnn_inp):
-        mll = VariationalELBO(self.likelihood, self.gplvm, num_data=len(rnn_inp))  # ,combine_terms=False)
+        mll = VariationalELBO(self.likelihood, self.gplvm, num_data=len(rnn_inp))
         sample = self.gplvm.sample_latent_variable()
         output = self.gplvm(sample)
         loss = mll(output, rnn_inp.T.to(device))

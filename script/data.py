@@ -64,7 +64,7 @@ def contains_numeric(w):
     return any(char.isdigit() for char in w)
 
 
-# document preprocessing
+# 1. document preprocessing
 init_docs = [re.findall(r'''[\w']+|[.,!?;-~{}`´_<=>:/@*()&'$%#"]|[\n]+''', doc) for doc in docs]
 init_docs = [[w.lower() for w in init_docs[doc] if not contains_punctuation(w)] for doc in range(len(init_docs))]
 init_docs = [[w for w in init_docs[doc] if not contains_numeric(w)] for doc in range(len(init_docs))]
@@ -78,6 +78,7 @@ cvz = cvectorizer.fit_transform(init_docs).sign()
 
 # Get vocabulary
 print('building the vocabulary...')
+# 2. count vectorizer
 sum_counts = cvz.sum(axis=0)
 v_size = sum_counts.shape[1]
 sum_counts_np = np.zeros(v_size, dtype=int)
@@ -146,6 +147,7 @@ def remove_empty(in_docs, in_timestamps):
     out_docs = []
     out_timestamps = []
     for ii, doc in enumerate(in_docs):
+        # check empty documents
         if (doc != []):
             out_docs.append(doc)
             out_timestamps.append(in_timestamps[ii])

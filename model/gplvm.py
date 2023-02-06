@@ -23,8 +23,8 @@ class bGPLVM(BayesianGPLVM):
         prior_x = NormalPrior(X_prior_mean, torch.ones_like(X_prior_mean).to(device))
         X_init = torch.nn.Parameter(torch.randn(n, latent_dim))
         # LatentVariable (c)
-        X = VariationalLatentVariable(n, data_dim, latent_dim, X_init, prior_x)
-        super().__init__(X, q_f)
+        self.X = VariationalLatentVariable(n, data_dim, latent_dim, X_init, prior_x)
+        super().__init__(self.X, q_f)
         self.mean_module = ZeroMean(ard_num_dims=latent_dim)
         self.covar_module = ScaleKernel(RBFKernel(ard_num_dims=latent_dim))
         init_lengthscale = 0.1
@@ -35,6 +35,11 @@ class bGPLVM(BayesianGPLVM):
         covar_x = self.covar_module(X)
         dist = MultivariateNormal(mean_x, covar_x)
         return dist
+
+    def get_state(self):
+        X = self.X.q_mu.detach().numpy()
+        std = self.X.q_log_sigma.detach().numpy()
+        return X, std
 
     def _get_batch_idx(self, batch_size):
         valid_indices = np.arange(self.n)

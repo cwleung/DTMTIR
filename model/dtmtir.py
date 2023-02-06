@@ -201,6 +201,9 @@ class DTMTIR(nn.Module):
         self.encoder = Encoder(vocab_size, num_topics, hidden, dropout, batchNorm).to(device)
         self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
                                useEmbedding, rho_size, delta).to(device)
+
+        self.lstm1 = nn.LSTM(num_times, num_topics, batch_first=True)
+
         # gplvm
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
         self.likelihood = GaussianLikelihood(batch_shape=(num_times, vocab_size)).to(device)
@@ -231,8 +234,10 @@ class DTMTIR(nn.Module):
         coeff = num_docs / bsz
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
+        # two-layers of lstm model
+        eta, (h_0, c_0) = self.lstm1(eta_gp)
         # THETA N(η,α^2I)
-        theta, kld_theta = self.get_theta(eta_gp, norm_bows, times)
+        theta, kld_theta = self.get_theta(eta, norm_bows, times)
         kld_theta = kld_theta.sum() * coeff
         # BETA
         beta, kl_beta = self.get_beta()

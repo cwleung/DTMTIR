@@ -13,18 +13,19 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class Encoder(nn.Module):
-    def __init__(self, vocab_size, num_topics, hidden, dropout, batchNorm):
+    def __init__(self, vocab_size, num_topics, eta_size, hidden, dropout, batchNorm):
         super().__init__()
         if torch.cuda.is_available():
             self.cuda()
 
         self.num_topics = num_topics
+        self.eta_size = eta_size
         self.batchNorm = batchNorm
         self.drop = nn.Dropout(dropout)  # dropout
-        self.fc1 = nn.Linear(vocab_size + 256, hidden)
-        self.fc2 = nn.Linear(hidden + 256, hidden)
-        self.fcmu = nn.Linear(hidden + 256, num_topics, bias=True)  # fully-connected layer output mu
-        self.fclv = nn.Linear(hidden + 256, num_topics, bias=True)  # fully-connected layer output sigma
+        self.fc1 = nn.Linear(vocab_size + eta_size, hidden)
+        self.fc2 = nn.Linear(hidden + eta_size, hidden)
+        self.fcmu = nn.Linear(hidden + eta_size, num_topics, bias=True)  # fully-connected layer output mu
+        self.fclv = nn.Linear(hidden + eta_size, num_topics, bias=True)  # fully-connected layer output sigma
         self.act1 = nn.Softplus()
         self.act2 = nn.Softplus()
 
@@ -202,11 +203,11 @@ class DTMTIR(nn.Module):
         self.eta_size = eta_size
         self.data_size = data_size
 
-        self.encoder = Encoder(vocab_size, num_topics, hidden, dropout, batchNorm).to(device)
+        self.encoder = Encoder(vocab_size, num_topics, eta_size, hidden, dropout, batchNorm).to(device)
         self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
                                useEmbedding, rho_size, delta).to(device)
 
-        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=True)
+        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False)
 
         # gplvm
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
@@ -235,17 +236,20 @@ class DTMTIR(nn.Module):
         return self.gplvm.X.q_mu, loss.sum()
 
     def forward(self, bows, norm_bows, times, rnn_inp, num_docs):
-        bsz = bows.size(0)
-        coeff = num_docs / bsz
+        assert (rnn_inp.shape == torch.Size([self.num_times, self.vocab_size]))
+        bsize = bows.size(0)
+        norm_coeff = num_docs / bsize
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
-        # two-layers of lstm model
         print(eta_gp.shape)
+        assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
+        # two-layers of lstm model
         eta, _ = self.lstm1(eta_gp)
-        assert (eta.shape == torch.Size([self.num_times, 256]))
+        print(eta.shape)
+        assert (eta.shape == torch.Size([self.num_times, self.eta_size]))
         # THETA N(η,α^2I)
         theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)
-        kld_theta = kld_theta.sum() * coeff
+        kld_theta = kld_theta.sum() * norm_coeff
         # BETA
         beta, kl_beta = self.get_beta()
         beta = beta[times.type('torch.LongTensor')]
@@ -258,7 +262,7 @@ class DTMTIR(nn.Module):
         pred = torch.bmm(theta, beta).squeeze(1).nan_to_num()
         logp = torch.log(pred + 1e-6).nan_to_num()
         nll = -(logp * bows).sum(-1)
-        nll = nll.sum() * coeff
+        nll = nll.sum() * norm_coeff
         return nll, kl_beta, kld_theta, kld_eta_gp
 
     def get_eta_result(self):

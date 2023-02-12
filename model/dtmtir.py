@@ -209,11 +209,15 @@ class DTMTIR(nn.Module):
     def get_beta(self):
         return self.decoder.get_beta()
 
-    def get_theta(self, eta, time_batch, bows, times):
-        eta_td = eta[times.type('torch.LongTensor')]
-        time_batch = time_batch[times.type('torch.LongTensor')]
-        theta, kl_theta = self.encoder(bows, eta_td, time_batch)
-        return theta, kl_theta
+    def get_theta(self, bows, eta, times):
+        # two-layers of lstm model
+        eta_lstm, _ = self.gru(eta)
+        assert (eta_lstm.shape == torch.Size([self.num_times, self.eta_size]))
+        # THETA N(η,α^2I)
+        eta_lstm_td = eta_lstm[times.type('torch.LongTensor')]
+        eta_gp_td = eta[times.type('torch.LongTensor')]
+        theta, kld_theta = self.encoder(bows, eta_lstm_td, eta_gp_td)
+        return theta, kld_theta
 
     def decode(self, theta, beta):
         res = torch.mm(theta, beta)
@@ -235,14 +239,7 @@ class DTMTIR(nn.Module):
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
         assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
-        # two-layers of lstm model
-        eta_lstm, _ = self.gru(eta_gp)
-        assert (eta_lstm.shape == torch.Size([self.num_times, self.eta_size]))
-        # THETA N(η,α^2I)
-        eta_lstm_td = eta_lstm[times.type('torch.LongTensor')]
-        eta_gp_td = eta_gp[times.type('torch.LongTensor')]
-        theta, kld_theta = self.encoder(bows, eta_lstm_td, eta_gp_td)
-        # theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)
+        theta, kld_theta = self.get_theta(bows, eta_gp, times)
         kld_theta = kld_theta.sum() * norm_coeff
         # BETA
         beta, kl_beta = self.get_beta()

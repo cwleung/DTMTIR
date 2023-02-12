@@ -207,7 +207,7 @@ class DTMTIR(nn.Module):
         self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
                                useEmbedding, rho_size, delta).to(device)
 
-        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False)
+        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False).to(device)
 
         # gplvm
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
@@ -268,7 +268,7 @@ class DTMTIR(nn.Module):
     def get_eta_result(self):
         return self.gplvm.X.q_mu, self.gplvm.X.q_log_sigma
 
-    def predict(self, d_bat, norm_d_bat, t_bat, rnn_inp):
+    def predict(self, d_bat, norm_d_bat, t_bat):
         """give out the test data set, return the corresponding perplexity"""
         self.eval()
         with torch.no_grad():
@@ -314,7 +314,6 @@ if __name__ == '__main__':
                    data_size=time
                    )
 
-    # batch_docs.shape, time_batch, train_rnn_inp, len(train_cvz)
     batch_docs = torch.randn(batch_size, vocab_size)
     time_batch = torch.randint(time, size=(batch_size,))
     train_rnn_inp = torch.randn((time, vocab_size))

@@ -52,26 +52,23 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std).to(device)
         return eps.mul_(std).add_(mu)
 
-    def forward(self, inp, res_inp, time_inp, eva=False):
-        print("nn input shape", inp.shape, res_inp.shape)
-        inp = torch.cat([inp, res_inp], dim=1).to(device)
-        print(inp.shape)
-        h = self.act1(self.fc1(inp))
+    def forward(self, bow, eta_lstm_td, eta_td, eva=False):
+        bow = torch.cat([bow, eta_lstm_td], dim=1).to(device)
+        h = self.act1(self.fc1(bow))
         h = self.norm1(h)  # layernorm
-        inp = torch.cat([h, res_inp], dim=1).to(device)
-        h = self.act2(self.fc2(inp))
+        bow = torch.cat([h, eta_lstm_td], dim=1).to(device)
+        h = self.act2(self.fc2(bow))
         h = self.norm2(h)  # layernorm
         h = self.drop(h)
-        h = torch.cat([h, res_inp], dim=1).to(device)
+        h = torch.cat([h, eta_lstm_td], dim=1).to(device)
         # μ and Σ are two inference networks
         mu_theta = self.fcmu(h)
         sig_theta = self.fclv(h)
-        print('mu, sig shape, ', mu_theta.shape, sig_theta.shape)
         if eva:
             return mu_theta.softmax(-1)
         z = self.reparameterize(mu_theta, sig_theta)
         theta = torch.softmax(z, -1).to(device)
-        kld_theta = self.get_kl(mu_theta, sig_theta, time_inp, 0.005 * torch.randn(self.num_topics).to(device))
+        kld_theta = self.get_kl(mu_theta, sig_theta, eta_td, 0.005 * torch.randn(self.num_topics).to(device))
         return theta, kld_theta
 
 
@@ -204,7 +201,7 @@ class DTMTIR(nn.Module):
         self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
                                useEmbedding, rho_size, delta).to(device)
 
-        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False).to(device)
+        self.gru = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False).to(device)
 
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
         self.likelihood = GaussianLikelihood(batch_shape=(num_times, vocab_size)).to(device)
@@ -231,7 +228,7 @@ class DTMTIR(nn.Module):
         # nll + kl_x + kl_u
         return self.gplvm.X.q_mu, loss.sum()
 
-    def forward(self, bows, norm_bows, times, rnn_inp, num_docs):
+    def forward(self, bows, times, rnn_inp, num_docs):
         assert (rnn_inp.shape == torch.Size([self.num_times, self.vocab_size]))
         bsize = bows.size(0)
         norm_coeff = num_docs / bsize
@@ -239,10 +236,13 @@ class DTMTIR(nn.Module):
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
         assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
         # two-layers of lstm model
-        eta, _ = self.lstm1(eta_gp)
-        assert (eta.shape == torch.Size([self.num_times, self.eta_size]))
+        eta_lstm, _ = self.gru(eta_gp)
+        assert (eta_lstm.shape == torch.Size([self.num_times, self.eta_size]))
         # THETA N(η,α^2I)
-        theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)
+        eta_lstm_td = eta_lstm[times.type('torch.LongTensor')]
+        eta_gp_td = eta_gp[times.type('torch.LongTensor')]
+        theta, kld_theta = self.encoder(bows, eta_lstm_td, eta_gp_td)
+        # theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)
         kld_theta = kld_theta.sum() * norm_coeff
         # BETA
         beta, kl_beta = self.get_beta()
@@ -262,27 +262,30 @@ class DTMTIR(nn.Module):
     def get_eta_result(self):
         return self.gplvm.X.q_mu, self.gplvm.X.q_log_sigma
 
-    def predict(self, d_bat, norm_d_bat, t_bat):
+    def predict(self, bow, norm_bow, times):
         """give out the test data set, return the corresponding perplexity"""
         self.eval()
         with torch.no_grad():
             # get eta(TxK)
-            eta = self.gplvm.X.q_mu
-            assert (eta.shape == torch.Size([self.num_times, self.num_topics]))
+            eta_gp = self.gplvm.X.q_mu
+            assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
             # get theta(DxK)
-            eta_td = eta[t_bat.type('torch.LongTensor')]
-            theta = self.encoder(d_bat, eta_td, eva=True)
-            assert (theta.shape == torch.Size([norm_d_bat.shape[0], self.num_topics]))
+            eta_lstm, _ = self.gru(eta_gp)
+            eta_lstm_td = eta_lstm[times.type('torch.LongTensor')]
+            eta_td = eta_gp[times.type('torch.LongTensor')]
+            theta = self.encoder(bow, eta_lstm_td, eta_td, eva=True)
+            print(theta.shape)
+            assert (theta.shape == torch.Size([norm_bow.shape[0], self.num_topics]))
             beta, kl_beta = self.get_beta()
-            beta = beta[t_bat.type('torch.LongTensor')]
+            beta = beta[times.type('torch.LongTensor')]
             assert (beta.shape == torch.Size(
-                [d_bat.shape[0], self.num_topics, self.vocab_size]
+                [bow.shape[0], self.num_topics, self.vocab_size]
             ))
             loglik = theta.unsqueeze(2) * beta
             pred = loglik.sum(1)
             logp = torch.log(pred)
-            sums = d_bat.sum(1).unsqueeze(1)
-            loss = (-logp * d_bat).sum(-1) / sums.squeeze()
+            sums = bow.sum(1).unsqueeze(1)
+            loss = (-logp * bow).sum(-1) / sums.squeeze()
             loss = loss.nan_to_num().mean().item()
             # ppl check when doing mini-batch
             ppl = round(math.exp(loss), 1)
@@ -312,5 +315,7 @@ if __name__ == '__main__':
     time_batch = torch.randint(time, size=(batch_size,))
     train_rnn_inp = torch.randn((time, vocab_size))
 
-    print(batch_docs.shape, time_batch.shape, train_rnn_inp.shape)
-    model(batch_docs, batch_docs, time_batch, train_rnn_inp, batch_size)
+    print('Test train')
+    model(batch_docs, time_batch, train_rnn_inp, batch_size)
+    print('Test predict')
+    model.predict(batch_docs, batch_docs, time_batch)

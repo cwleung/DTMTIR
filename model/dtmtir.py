@@ -21,21 +21,22 @@ class Encoder(nn.Module):
         self.num_topics = num_topics
         self.batchNorm = batchNorm
         self.drop = nn.Dropout(dropout)  # dropout
-        self.fc1 = nn.Linear(vocab_size + num_topics, hidden)
-        self.fc2 = nn.Linear(hidden + num_topics, hidden)
-        self.fcmu = nn.Linear(hidden + num_topics, num_topics, bias=True)  # fully-connected layer output mu
-        self.fclv = nn.Linear(hidden + num_topics, num_topics, bias=True)  # fully-connected layer output sigma
+        self.fc1 = nn.Linear(vocab_size + 256, hidden)
+        self.fc2 = nn.Linear(hidden + 256, hidden)
+        self.fcmu = nn.Linear(hidden + 256, num_topics, bias=True)  # fully-connected layer output mu
+        self.fclv = nn.Linear(hidden + 256, num_topics, bias=True)  # fully-connected layer output sigma
         self.act1 = nn.Softplus()
         self.act2 = nn.Softplus()
 
         self.norm1 = nn.LayerNorm(hidden, elementwise_affine=False)
         self.norm2 = nn.LayerNorm(hidden, elementwise_affine=False)
 
-        self.bnmu = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
-        self.bnlv = nn.BatchNorm1d(num_topics, affine=False)  # to avoid component collapse
+        self.bnmu = nn.BatchNorm1d(hidden, affine=False)  # to avoid component collapse
+        self.bnlv = nn.BatchNorm1d(hidden, affine=False)  # to avoid component collapse
 
     def get_kl(self, q_mu, q_logsigma, p_mu=None, p_logsigma=None):
-        """ Gaussian KL Divergence
+        """
+        Gaussian KL Divergence
         Returns KL( N(q_mu, q_logsigma) || N(p_mu, p_logsigma) ).
         """
         if p_mu is not None and p_logsigma is not None:
@@ -53,8 +54,10 @@ class Encoder(nn.Module):
         eps = torch.randn_like(std).to(device)
         return eps.mul_(std).add_(mu)
 
-    def forward(self, inp, res_inp, eva=False):
+    def forward(self, inp, res_inp, time_inp, eva=False):
+        print("nn input shape", inp.shape, res_inp.shape)
         inp = torch.cat([inp, res_inp], dim=1).to(device)
+        print(inp.shape)
         h = self.act1(self.fc1(inp))
         h = self.norm1(h)  # layernorm
         inp = torch.cat([h, res_inp], dim=1).to(device)
@@ -65,11 +68,12 @@ class Encoder(nn.Module):
         # μ and Σ are two inference networks
         mu_theta = self.fcmu(h)
         sig_theta = self.fclv(h)
+        print('mu, sig shape, ', mu_theta.shape, sig_theta.shape)
         if eva:
             return mu_theta.softmax(-1)
         z = self.reparameterize(mu_theta, sig_theta)
         theta = torch.softmax(z, -1).to(device)
-        kld_theta = self.get_kl(mu_theta, sig_theta, res_inp, 0.005 * torch.randn(self.num_topics).to(device))
+        kld_theta = self.get_kl(mu_theta, sig_theta, time_inp, 0.005 * torch.randn(self.num_topics).to(device))
         return theta, kld_theta
 
 
@@ -184,7 +188,7 @@ class DTMTIR(nn.Module):
 
     def __init__(self, vocab_size, num_topics, num_times, hidden, dropout,
                  delta, data_size, useEmbedding=False, eta_size=256, rho_size=256, batchNorm=True):
-        super().__init__()
+        super(DTMTIR, self).__init__()
 
         if torch.cuda.is_available():
             self.cuda()
@@ -202,7 +206,7 @@ class DTMTIR(nn.Module):
         self.decoder = Decoder(vocab_size, num_topics, num_times, dropout,
                                useEmbedding, rho_size, delta).to(device)
 
-        self.lstm1 = nn.LSTM(num_times, num_topics, batch_first=True)
+        self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=True)
 
         # gplvm
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
@@ -211,9 +215,10 @@ class DTMTIR(nn.Module):
     def get_beta(self):
         return self.decoder.get_beta()
 
-    def get_theta(self, eta, bows, times):
+    def get_theta(self, eta, time_batch, bows, times):
         eta_td = eta[times.type('torch.LongTensor')]
-        theta, kl_theta = self.encoder(bows, eta_td)
+        time_batch = time_batch[times.type('torch.LongTensor')]
+        theta, kl_theta = self.encoder(bows, eta_td, time_batch)
         return theta, kl_theta
 
     def decode(self, theta, beta):
@@ -222,10 +227,10 @@ class DTMTIR(nn.Module):
         return preds
 
     def get_mu(self, rnn_inp):
-        mll = VariationalELBO(self.likelihood, self.gplvm, num_data=len(rnn_inp))
+        mll = VariationalELBO(self.likelihood, self.gplvm, num_data=len(rnn_inp))  # ,combine_terms=False)
         sample = self.gplvm.sample_latent_variable()
         output = self.gplvm(sample)
-        loss = mll(output, rnn_inp.T.to(device))
+        loss = -mll(output, rnn_inp.T.to(device))
         # nll + kl_x + kl_u
         return self.gplvm.X.q_mu, loss.sum()
 
@@ -235,9 +240,11 @@ class DTMTIR(nn.Module):
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
         # two-layers of lstm model
-        eta, (h_0, c_0) = self.lstm1(eta_gp)
+        print(eta_gp.shape)
+        eta, _ = self.lstm1(eta_gp)
+        assert (eta.shape == torch.Size([self.num_times, 256]))
         # THETA N(η,α^2I)
-        theta, kld_theta = self.get_theta(eta, norm_bows, times)
+        theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)
         kld_theta = kld_theta.sum() * coeff
         # BETA
         beta, kl_beta = self.get_beta()
@@ -255,7 +262,7 @@ class DTMTIR(nn.Module):
         return nll, kl_beta, kld_theta, kld_eta_gp
 
     def get_eta_result(self):
-        return self.gplvm.X.q_mu
+        return self.gplvm.X.q_mu, self.gplvm.X.q_log_sigma
 
     def predict(self, d_bat, norm_d_bat, t_bat, rnn_inp):
         """give out the test data set, return the corresponding perplexity"""
@@ -282,3 +289,31 @@ class DTMTIR(nn.Module):
             # ppl check when doing mini-batch
             ppl = round(math.exp(loss), 1)
             return ppl
+
+
+if __name__ == '__main__':
+    # smoke test
+    time = 20
+    batch_size = 32
+    vocab_size = 200
+    num_topics = 30
+
+    model = DTMTIR(vocab_size=vocab_size,
+                   num_topics=num_topics,
+                   num_times=time,
+                   hidden=800,
+                   dropout=0.0,
+                   delta=0.005,
+                   useEmbedding=True,
+                   rho_size=300,
+                   eta_size=128,
+                   data_size=time
+                   )
+
+    # batch_docs.shape, time_batch, train_rnn_inp, len(train_cvz)
+    batch_docs = torch.randn(batch_size, vocab_size)
+    time_batch = torch.randint(time, size=(batch_size,))
+    train_rnn_inp = torch.randn((time, vocab_size))
+
+    print(batch_docs.shape, time_batch.shape, train_rnn_inp.shape)
+    model(batch_docs, batch_docs, time_batch, train_rnn_inp, batch_size)

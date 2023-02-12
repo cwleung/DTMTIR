@@ -2,6 +2,8 @@ import torch
 import numpy as np
 
 from gpytorch.distributions import MultivariateNormal
+from gpytorch import kernels
+
 from gpytorch.kernels import ScaleKernel, RBFKernel
 from gpytorch.means import ZeroMean
 from gpytorch.models.gplvm.bayesian_gplvm import BayesianGPLVM
@@ -23,13 +25,20 @@ class bGPLVM(BayesianGPLVM):
         prior_x = NormalPrior(X_prior_mean, torch.ones_like(X_prior_mean).to(device))
         X_init = torch.nn.Parameter(torch.randn(n, latent_dim))
         # LatentVariable (c)
-        self.X = VariationalLatentVariable(n, data_dim, latent_dim, X_init, prior_x)
-        super().__init__(self.X, q_f)
+        X = VariationalLatentVariable(n, data_dim, latent_dim, X_init, prior_x)
+        super().__init__(X, q_f)
         self.mean_module = ZeroMean(ard_num_dims=latent_dim)
-        self.covar_module = ScaleKernel(RBFKernel(ard_num_dims=latent_dim))
-        init_lengthscale = 0.1
-        self.covar_module.base_kernel.lengthscale = init_lengthscale
+        k_trend = (kernels.ScaleKernel(kernels.PolynomialKernel(power=1, ard_num_dims=latent_dim)) +
+                   kernels.ScaleKernel(kernels.MaternKernel(ard_num_dims=latent_dim)))
 
+        k_noise = kernels.ScaleKernel(kernels.LinearKernel(ard_num_dims=latent_dim))  # WhiteNoiseKernel(noise=0.1)) *
+
+        kernel = kernels.AdditiveKernel(k_trend, k_noise)
+
+        self.covar_module = k_trend  # ScaleKernel(RBFKernel(ard_num_dims=latent_dim))
+
+    #         init_lengthscale = 0.1
+    #         self.covar_module.base_kernel.lengthscale = init_lengthscale
     def forward(self, X):
         mean_x = self.mean_module(X)
         covar_x = self.covar_module(X)

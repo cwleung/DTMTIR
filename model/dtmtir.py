@@ -1,7 +1,4 @@
-import gpytorch
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from gpytorch.likelihoods import GaussianLikelihood
 from gpytorch.mlls import VariationalELBO
 from gpytorch.models.gplvm.latent_variable import *
@@ -209,7 +206,6 @@ class DTMTIR(nn.Module):
 
         self.lstm1 = nn.GRU(num_topics, eta_size, batch_first=True, num_layers=2, bidirectional=False).to(device)
 
-        # gplvm
         self.gplvm = bGPLVM(self.data_size, vocab_size, self.num_topics, 100).to(device)
         self.likelihood = GaussianLikelihood(batch_shape=(num_times, vocab_size)).to(device)
 
@@ -241,11 +237,9 @@ class DTMTIR(nn.Module):
         norm_coeff = num_docs / bsize
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
-        print(eta_gp.shape)
         assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
         # two-layers of lstm model
         eta, _ = self.lstm1(eta_gp)
-        print(eta.shape)
         assert (eta.shape == torch.Size([self.num_times, self.eta_size]))
         # THETA N(η,α^2I)
         theta, kld_theta = self.get_theta(eta, eta_gp, norm_bows, times)

@@ -6,6 +6,8 @@ import math
 
 from model.gplvm import bGPLVM
 
+import torch.nn.functional as F
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -238,6 +240,7 @@ class DTMTIR(nn.Module):
         norm_coeff = num_docs / bsize
         ## ETA
         eta_gp, kld_eta_gp = self.get_mu(rnn_inp)
+        eta_gp = F.gumbel_softmax(eta_gp, tau=0.5, hard=False)
         assert (eta_gp.shape == torch.Size([self.num_times, self.num_topics]))
         theta, kld_theta = self.get_theta(bows, eta_gp, times)
         kld_theta = kld_theta.sum() * norm_coeff
